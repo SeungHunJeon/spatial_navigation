@@ -1,0 +1,4 @@
+.idea/*
+.vscode/*
+wandb/*
+runs_figure*
