@@ -202,6 +202,7 @@ def make_episode(cfg: TaskConfig):
 # 3) Model: encoder + aggregator + heads
 # --------------------------------
 
+# ========== 기존 PerStepEncoder 및 RNN 셀들 ==========
 class PerStepEncoder(nn.Module):
     def __init__(self, in_dim=3+1+7, hid=128):
         super().__init__()
@@ -233,9 +234,10 @@ class GRUCell(nn.Module):
         return h_t, c_prev
 
 class SRULSTMCell(nn.Module):
-    def __init__(self, in_dim, hid):
+    def __init__(self, in_dim, hid, refined=False):
         super().__init__()
         self.hid = hid
+        self.refined = refined
         self.i = nn.Linear(in_dim + hid, hid)
         self.f = nn.Linear(in_dim + hid, hid)
         self.o = nn.Linear(in_dim + hid, hid)
@@ -251,10 +253,18 @@ class SRULSTMCell(nn.Module):
         s_t = self.xs(x)
         cand_lin = self.xg(x) + self.hg(h_prev)
         g_t = torch.tanh(s_t * cand_lin)
-        c_t = f_t * c_prev + i_t * g_t
+
+        if self.refined:
+            # r_t = i_t ⊙ (1 - (1 - f_t)^2) + (1 - i_t) ⊙ (f_t^2)
+            r_t = i_t * (1 - (1 - f_t) ** 2) + (1 - i_t) * (f_t ** 2)
+            c_t = r_t * c_prev + (1 - r_t) * g_t
+        else:
+            c_t = f_t * c_prev + i_t * g_t
+
         h_t = o_t * torch.tanh(c_t)
         return h_t, c_t
 
+# ========== Delta Positional Encoding (기존과 동일) ==========
 class DeltaPositionalEncoding(nn.Module):
     def __init__(self, d_model, use_sinus=True):
         super().__init__()
@@ -282,6 +292,7 @@ class DeltaPositionalEncoding(nn.Module):
             return m + pe_sin
         return m
 
+# ========== Delta Transformer (기존) ==========
 class DeltaTransformerAggregator(nn.Module):
     def __init__(self, d_model=128, nhead=4, num_layers=4, dim_feedforward=256, dropout=0.1):
         super().__init__()
@@ -299,6 +310,63 @@ class DeltaTransformerAggregator(nn.Module):
         h_T = mem[:, -1, :]
         return h_T
 
+# ========== 논문식 DeltaNet ==========
+class DeltaNetLayer(nn.Module):
+    def __init__(self, d_model, beta_hidden=64, layernorm=True):
+        super().__init__()
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_k = nn.Linear(d_model, d_model)
+        self.W_v = nn.Linear(d_model, d_model)
+        self.W_beta = nn.Sequential(
+            nn.Linear(d_model, beta_hidden),
+            nn.ReLU(),
+            nn.Linear(beta_hidden, 1),
+        )
+        self.layernorm = nn.LayerNorm(d_model) if layernorm else nn.Identity()
+
+    def forward(self, x):
+        """
+        x: [B, T, d_model]
+        """
+        B, T, D = x.shape
+        q = self.W_q(x)
+        k = self.W_k(x)
+        v = self.W_v(x)
+        beta = torch.sigmoid(self.W_beta(x))  # [B,T,1]
+
+        S = torch.zeros(B, D, D, device=x.device, dtype=x.dtype)
+        outs = []
+        eye = torch.eye(D, device=x.device).unsqueeze(0)  # [1,D,D]
+
+        for t in range(T):
+            k_t = k[:, t, :].unsqueeze(2)
+            v_t = v[:, t, :].unsqueeze(2)
+            q_t = q[:, t, :].unsqueeze(2)
+            b_t = beta[:, t, :].view(B, 1, 1)
+
+            # Delta rule update
+            S = S @ (eye - b_t * (k_t @ k_t.transpose(1,2))) + b_t * (v_t @ k_t.transpose(1,2))
+            o_t = (S @ q_t).squeeze(2)
+            outs.append(o_t)
+
+        out = torch.stack(outs, dim=1)
+        return self.layernorm(out)
+
+# ========== DeltaNet + DeltaPositionalEncoding ==========
+class DeltaNetWithDeltaPE(nn.Module):
+    def __init__(self, d_model=128, num_layers=2, beta_hidden=64):
+        super().__init__()
+        self.layers = nn.ModuleList([DeltaNetLayer(d_model, beta_hidden) for _ in range(num_layers)])
+        self.delta_pe = DeltaPositionalEncoding(d_model)
+        self.norm_out = nn.LayerNorm(d_model)
+
+    def forward(self, x, motion_seq):
+        x = x + self.delta_pe(motion_seq, x.size(-1))
+        for layer in self.layers:
+            x = layer(x)
+        return self.norm_out(x)
+
+# ========== Head Decoder ==========
 class HeadDecoder(nn.Module):
     def __init__(self, hid, T):
         super().__init__()
@@ -318,6 +386,7 @@ class HeadDecoder(nn.Module):
         labels = self.label_head(h_T)
         return coords, labels
 
+# ========== 통합 SpatialMemoryNet ==========
 class SpatialMemoryNet(nn.Module):
     def __init__(self, steps=15, enc_hid=128, rec_hid=128, cell_type='lstm',
                  tf_heads=4, tf_layers=4, tf_ff=256, tf_dropout=0.1):
@@ -326,28 +395,42 @@ class SpatialMemoryNet(nn.Module):
         self.cell_type = cell_type
         self.encoder = PerStepEncoder(in_dim=3+1+7, hid=enc_hid)
 
-        if cell_type in ['lstm', 'gru', 'sru_lstm']:
+        if cell_type in ['lstm', 'gru', 'sru_lstm', 'sru_lstm_refined']:
             if cell_type == 'lstm':
                 self.cell = LSTMCell(enc_hid, rec_hid)
             elif cell_type == 'gru':
                 self.cell = GRUCell(enc_hid, rec_hid)
+            elif cell_type == 'sru_lstm_refined':
+                self.cell = SRULSTMCell(enc_hid, rec_hid, refined=True)
             else:
                 self.cell = SRULSTMCell(enc_hid, rec_hid)
             self.hid = rec_hid
             self.decoder = HeadDecoder(rec_hid, steps)
+
         elif cell_type == 'delta_transformer':
-            self.aggregator = DeltaTransformerAggregator(d_model=enc_hid, nhead=tf_heads,
-                                                         num_layers=tf_layers, dim_feedforward=tf_ff,
-                                                         dropout=tf_dropout)
+            self.aggregator = DeltaTransformerAggregator(
+                d_model=enc_hid, nhead=tf_heads, num_layers=tf_layers,
+                dim_feedforward=tf_ff, dropout=tf_dropout)
             self.hid = enc_hid
             self.decoder = HeadDecoder(enc_hid, steps)
+
+        elif cell_type == 'deltanet':
+            self.aggregator = DeltaNetLayer(enc_hid)
+            self.hid = enc_hid
+            self.decoder = HeadDecoder(enc_hid, steps)
+
+        elif cell_type == 'deltanet_delta_pe':
+            self.aggregator = DeltaNetWithDeltaPE(d_model=enc_hid)
+            self.hid = enc_hid
+            self.decoder = HeadDecoder(enc_hid, steps)
+
         else:
-            raise ValueError("cell_type must be one of: lstm, gru, sru_lstm, delta_transformer")
+            raise ValueError("cell_type must be one of: lstm, gru, sru_lstm, delta_transformer, deltanet, deltanet_delta_pe")
 
     def forward(self, obs_l, obs_c, obs_m):
         B, T, _ = obs_l.shape
-        x = torch.cat([obs_l, obs_c, obs_m], dim=-1)   # [B,T,11]
-        z = self.encoder(x)                            # [B,T,enc_hid]
+        x = torch.cat([obs_l, obs_c, obs_m], dim=-1)
+        z = self.encoder(x)
 
         if self.cell_type in ['lstm', 'gru', 'sru_lstm']:
             h = torch.zeros(B, self.hid, device=obs_l.device)
@@ -355,13 +438,21 @@ class SpatialMemoryNet(nn.Module):
             for t in range(T):
                 h, c = self.cell(z[:, t, :], (h, c))
             h_T = h
-        else:
-            h_T = self.aggregator(z, obs_m)  # [B,enc_hid]
+
+        elif self.cell_type == 'delta_transformer':
+            h_T = self.aggregator(z, obs_m)
+
+        elif self.cell_type == 'deltanet':
+            h_seq = self.aggregator(z)
+            h_T = h_seq[:, -1, :]
+
+        elif self.cell_type == 'deltanet_delta_pe':
+            h_seq = self.aggregator(z, obs_m)
+            h_T = h_seq[:, -1, :]
 
         coords_flat, label_logits = self.decoder(h_T)
         coords = coords_flat.view(B, self.steps, 3)
         return coords, label_logits
-
 # ---------------------------
 # 4) Training / Evaluation
 # ---------------------------
@@ -530,7 +621,7 @@ def run_one(args, cell_type, device, group=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cell", type=str, default="lstm",
-                    choices=["lstm","gru","sru_lstm","delta_transformer","all"])
+                    choices=["lstm","gru","sru_lstm", "sru_lstm_refined", "delta_transformer","deltanet","deltanet_delta_pe","all"])
     ap.add_argument("--steps", type=int, default=15)
     ap.add_argument("--hidden", type=int, default=128, help="RNN hidden size or Transformer d_model")
     ap.add_argument("--enc", type=int, default=128, help="Per-step encoder hidden (also d_model for transformer)")
@@ -560,7 +651,7 @@ def main():
     # If all, loop over all cells under a common WANDB group
     if args.cell == "all":
         group = args.wandb_group or "model-sweep"
-        for cell in ["lstm","gru","sru_lstm","delta_transformer"]:
+        for cell in ["lstm","gru","sru_lstm", "sru_lstm_refined", "delta_transformer", "deltanet", "deltanet_delta_pe"]:
             run_one(args, cell, device, group=group)
     else:
         run_one(args, args.cell, device, group=args.wandb_group)

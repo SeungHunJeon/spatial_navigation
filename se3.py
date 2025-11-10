@@ -295,6 +295,68 @@ class DeltaPositionalEncoding(nn.Module):
             return m + pe_sin
         return m
 
+
+# ===== DeltaNet (논문식 Delta Rule Attention) =====
+class DeltaNetLayer(nn.Module):
+    def __init__(self, d_model, beta_hidden=64, layernorm=True):
+        super().__init__()
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_k = nn.Linear(d_model, d_model)
+        self.W_v = nn.Linear(d_model, d_model)
+        self.W_beta = nn.Sequential(
+            nn.Linear(d_model, beta_hidden),
+            nn.ReLU(),
+            nn.Linear(beta_hidden, 1),
+        )
+        self.layernorm = nn.LayerNorm(d_model) if layernorm else nn.Identity()
+
+    def forward(self, x):
+        """
+        x: [B, T, d_model]
+        """
+        B, T, D = x.shape
+        q = self.W_q(x)
+        k = self.W_k(x)
+        v = self.W_v(x)
+        beta = torch.sigmoid(self.W_beta(x))  # [B,T,1]
+
+        S = torch.zeros(B, D, D, device=x.device, dtype=x.dtype)
+        outs = []
+        eye = torch.eye(D, device=x.device).unsqueeze(0)  # [1,D,D]
+
+        for t in range(T):
+            k_t = k[:, t, :].unsqueeze(2)       # [B,D,1]
+            v_t = v[:, t, :].unsqueeze(2)       # [B,D,1]
+            q_t = q[:, t, :].unsqueeze(2)       # [B,D,1]
+            b_t = beta[:, t, :].view(B, 1, 1)   # [B,1,1]
+
+            # Delta rule update: S_t = S_{t-1}(I - βk kᵀ) + βv kᵀ
+            S = S @ (eye - b_t * (k_t @ k_t.transpose(1,2))) + b_t * (v_t @ k_t.transpose(1,2))
+
+            o_t = (S @ q_t).squeeze(2)
+            outs.append(o_t)
+
+        out = torch.stack(outs, dim=1)
+        return self.layernorm(out)
+
+
+# ===== DeltaNet + DeltaPositionalEncoding =====
+class DeltaNetWithDeltaPE(nn.Module):
+    def __init__(self, d_model=128, num_layers=2, beta_hidden=64):
+        super().__init__()
+        self.layers = nn.ModuleList([DeltaNetLayer(d_model, beta_hidden) for _ in range(num_layers)])
+        self.delta_pe = DeltaPositionalEncoding(d_model)
+        self.norm_out = nn.LayerNorm(d_model)
+
+    def forward(self, x, motion_seq):
+        """
+        x: [B,T,d_model], motion_seq: [B,T,7]
+        """
+        x = x + self.delta_pe(motion_seq, x.size(-1))
+        for layer in self.layers:
+            x = layer(x)
+        return self.norm_out(x)
+
 class DeltaTransformerAggregator(nn.Module):
     def __init__(self, d_model=128, nhead=4, num_layers=4, dim_feedforward=256, dropout=0.1):
         super().__init__()
@@ -353,14 +415,27 @@ class SpatialMemoryNet(nn.Module):
                 self.cell = SRULSTMCell(enc_hid, rec_hid)
             self.hid = rec_hid
             self.decoder = HeadDecoder(rec_hid, steps)
+
         elif cell_type == 'delta_transformer':
-            self.aggregator = DeltaTransformerAggregator(d_model=enc_hid, nhead=tf_heads,
-                                                         num_layers=tf_layers, dim_feedforward=tf_ff,
-                                                         dropout=tf_dropout)
+            self.aggregator = DeltaTransformerAggregator(
+                d_model=enc_hid, nhead=tf_heads,
+                num_layers=tf_layers, dim_feedforward=tf_ff,
+                dropout=tf_dropout)
             self.hid = enc_hid
             self.decoder = HeadDecoder(enc_hid, steps)
+
+        elif cell_type == 'deltanet':
+            self.aggregator = DeltaNetLayer(enc_hid)
+            self.hid = enc_hid
+            self.decoder = HeadDecoder(enc_hid, steps)
+
+        elif cell_type == 'deltanet_delta_pe':
+            self.aggregator = DeltaNetWithDeltaPE(d_model=enc_hid)
+            self.hid = enc_hid
+            self.decoder = HeadDecoder(enc_hid, steps)
+
         else:
-            raise ValueError("cell_type must be one of: lstm, gru, sru_lstm, delta_transformer")
+            raise ValueError("cell_type must be one of: lstm, gru, sru_lstm, delta_transformer, deltanet, deltanet_delta_pe")
 
     def forward(self, obs_l, obs_c, obs_m):
         """
@@ -378,14 +453,21 @@ class SpatialMemoryNet(nn.Module):
             for t in range(T):
                 h, c = self.cell(z[:, t, :], (h, c))
             h_T = h
-        else:
-            # delta_transformer
-            h_T = self.aggregator(z, obs_m)  # [B,enc_hid]
+
+        elif self.cell_type == 'delta_transformer':
+            h_T = self.aggregator(z, obs_m)
+
+        elif self.cell_type == 'deltanet':
+            h_seq = self.aggregator(z)
+            h_T = h_seq[:, -1, :]
+
+        elif self.cell_type == 'deltanet_delta_pe':
+            h_seq = self.aggregator(z, obs_m)
+            h_T = h_seq[:, -1, :]
 
         coords_flat, label_logits = self.decoder(h_T)
         coords = coords_flat.view(B, self.steps, 3)
         return coords, label_logits
-
 # ---------------------------
 # 4) Training / Evaluation
 # ---------------------------
@@ -478,7 +560,7 @@ def plot_mapping_example(model, cfg, args, device="cpu", title=""):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cell", type=str, default="lstm", choices=["lstm","gru","sru_lstm","delta_transformer"])
+    ap.add_argument("--cell", type=str, default="lstm", choices=["lstm","gru","sru_lstm","delta_transformer", "deltanet", "deltanet_delta_pe"])
     ap.add_argument("--steps", type=int, default=15)
     ap.add_argument("--hidden", type=int, default=128, help="RNN hidden size or Transformer d_model")
     ap.add_argument("--enc", type=int, default=128, help="Per-step encoder hidden (also d_model for transformer)")
