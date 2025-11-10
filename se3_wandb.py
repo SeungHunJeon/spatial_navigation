@@ -432,7 +432,7 @@ class SpatialMemoryNet(nn.Module):
         x = torch.cat([obs_l, obs_c, obs_m], dim=-1)
         z = self.encoder(x)
 
-        if self.cell_type in ['lstm', 'gru', 'sru_lstm']:
+        if self.cell_type in ['lstm', 'gru', 'sru_lstm', 'sru_lstm_refined']:
             h = torch.zeros(B, self.hid, device=obs_l.device)
             c = torch.zeros_like(h)
             for t in range(T):
