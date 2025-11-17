@@ -127,7 +127,7 @@ class DeltaNetLayer(nn.Module):
         )
         self.layernorm = nn.LayerNorm(d_model) if layernorm else nn.Identity()
 
-    def forward(self, x):
+    def forward(self, x, S=None):
         """
         x: [B, T, d_model]
         """
@@ -137,9 +137,9 @@ class DeltaNetLayer(nn.Module):
         v = self.W_v(x)
         beta = torch.sigmoid(self.W_beta(x))  # [B,T,1]
 
-        S = torch.zeros(B, D, D, device=x.device, dtype=x.dtype)
+        if( S is None):
+            S = torch.zeros(B, D, D, device=x.device, dtype=x.dtype)
         outs = []
-        eye = torch.eye(D, device=x.device).unsqueeze(0)  # [1,D,D]
 
         for t in range(T):
             k_t = k[:, t, :].unsqueeze(2)
@@ -148,12 +148,11 @@ class DeltaNetLayer(nn.Module):
             b_t = beta[:, t, :].view(B, 1, 1)
 
             # Delta rule update
-            S = S @ (eye - b_t * (k_t @ k_t.transpose(1,2))) + b_t * (v_t @ k_t.transpose(1,2))
-            o_t = (S @ q_t).squeeze(2)
+            o_t, S = delta_rule_recurrent_step(q_t, k_t, v_t, b_t, S)
             outs.append(o_t)
 
         out = torch.stack(outs, dim=1)
-        return self.layernorm(out)
+        return self.layernorm(out), S
 
 # ========== Head Decoder ==========
 class HeadDecoder(nn.Module):
@@ -210,7 +209,17 @@ class SpatialMemoryNet(nn.Module):
 
         elif cell_type == "deltanet_transformer":
             self.aggregator = DeltaNetTransformer(
-                d_model=enc_hid, d_ff=tf_ff, num_layers=tf_layers, dropout=tf_dropout
+                d_model=enc_hid, num_layers=tf_layers
+            )
+            self.hid = enc_hid
+            self.decoder = HeadDecoder(enc_hid, steps)
+
+        elif cell_type == "gated_deltanet":
+            self.aggregator = GatedDeltaNetAggregator(
+                d_model=enc_hid,
+                num_heads=tf_heads,
+                bidirectional=False,     # causal seq
+                min_len_for_chunk=65     # ensures chunk mode during training
             )
             self.hid = enc_hid
             self.decoder = HeadDecoder(enc_hid, steps)
@@ -234,12 +243,17 @@ class SpatialMemoryNet(nn.Module):
             h_T = self.aggregator(z, obs_m)
 
         elif self.cell_type == 'deltanet':
-            h_seq = self.aggregator(z)
-            h_T = h_seq[:, -1, :]
+            S = None
+            for t in range(T):
+                h_t, S = self.aggregator.forward(z[:, t, :].unsqueeze(1), S)
+            h_T = h_t.squeeze(1)
 
         elif self.cell_type == 'deltanet_transformer':
             h_seq = self.aggregator(z)
             h_T = h_seq[:, -1, :]
+
+        elif self.cell_type == 'gated_deltanet':
+            h_T = self.aggregator(z)
 
         coords_flat, label_logits = self.decoder(h_T)
         coords = coords_flat.view(B, self.steps, 3)
@@ -250,6 +264,62 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from fla.layers import GatedDeltaNet
+
+class GatedDeltaNetAggregator(nn.Module):
+    """
+    Safe wrapper so SpatialMemoryNet can use FLA GatedDeltaNet
+    even when seq_len <= 64 in training.
+
+    - If training & T <= 64 → automatically pads to >= 65
+      to force FLA to use chunk mode (the only mode stable in training).
+    - Output h_T is always the *true* last-step state (index T-1).
+    """
+    def __init__(self, d_model=128, num_heads=4, bidirectional=False, min_len_for_chunk=65):
+        super().__init__()
+        self.min_len_for_chunk = min_len_for_chunk
+
+        # the official Gated DeltaNet layer
+        self.delta = GatedDeltaNet(
+            hidden_size=d_model,
+            num_heads=num_heads,
+            bidirectional=bidirectional,
+            mode="chunk",          # must be chunk mode for training
+            chunk_size=None        # let FLA auto-select optimal chunk
+        )
+
+    def forward(self, z_seq, motion_seq=None):
+        """
+        z_seq: (B, T, d)
+        return: (B, d)  -- final hidden state
+        """
+        B, T, D = z_seq.shape
+
+        # ========== TRAINING CASE (T <= 64 requires padding) ==========
+        if self.training and T <= 64:
+            pad_len = self.min_len_for_chunk - T
+            if pad_len < 0:
+                pad_len = 0
+
+            if pad_len > 0:
+                pad = torch.zeros(B, pad_len, D,
+                                  device=z_seq.device,
+                                  dtype=z_seq.dtype)
+                z_in = torch.cat([z_seq, pad], dim=1)  # (B, T+pad_len, D)
+            else:
+                z_in = z_seq
+
+            # Forward through FLA (returns y, kv, gate)
+            y, _, _ = self.delta(z_in)
+
+            # IMPORTANT:
+            # We must return the *true* last state of the real sequence
+            return y[:, T - 1, :]
+
+        # ========== EVAL OR LONG SEQ ==========
+        else:
+            y, _, _ = self.delta(z_seq)
+            return y[:, -1, :]
 
 # ============================================================
 # RMSNorm
@@ -283,191 +353,84 @@ class SwiGLU(nn.Module):
 # ============================================================
 # Depthwise Conv (short conv)
 # ============================================================
-class DepthwiseConv1d(nn.Module):
-    def __init__(self, dim, kernel_size=3):
-        super().__init__()
-        padding = kernel_size // 2
-        self.conv = nn.Conv1d(dim, dim, kernel_size, padding=padding, groups=dim)
-
-    def forward(self, x):
-        # x: (B, L, D)
-        return self.conv(x.transpose(1, 2)).transpose(1, 2)
-
-
-# ============================================================
-# Delta Rule core (병렬/순차 둘 다 가능)
-# ============================================================
-# (➡️ 이미 완성된 DeltaBlock 은 그대로 복사)
-# ------------------------------------------------------------
-# 🔥 여기에는 너가 직전에 만든 DeltaBlock 코드가 통째로 들어간다고 보면 됨
-# ------------------------------------------------------------
-
-# === 👇 그대로 붙여넣음 ====================================
-
-def chunk_batched_delta_rule_forward(Q, K, V, beta, C: int):
-    B, L, d = Q.shape
-    assert L % C == 0
-    device = Q.device
-    dtype = Q.dtype
-
-    Q, K, V = map(lambda x: x.reshape(B, -1, C, d), (Q, K, V))
-    beta = beta.reshape(B, -1, C)
-
-    K_beta = K * beta.unsqueeze(-1)
-    V_beta = V * beta.unsqueeze(-1)
-
-    mask_upper = torch.triu(torch.ones(C, C, device=device, dtype=torch.bool), 0)
-
-    K_t = K.transpose(2, 3)
-    T = -(K_beta @ K_t)
-    T = T.masked_fill(mask_upper, 0)
-
-    eye = torch.eye(C, device=device, dtype=dtype).unsqueeze(0)
-
-    # -------- SAFE FORWARD SUBSTITUTION (no inplace) --------
-    for k in range(L // C):
-        for i in range(1, C):
-            T_slice = T[:, k, i, :i]                          # (B, i)
-            upd = (T[:, k, i, :, None] * T[:, k, :, :i]).sum(-2)
-            T = T.clone()
-            T[:, k, i, :i] = T_slice + upd
-
-        T = T.clone()
-        T[:, k] = T[:, k] + eye
-
-    # --------------------------------------------------------
-    W = T @ K_beta
-    U = T @ V_beta
-
-    S = torch.zeros(B, d, d, device=device, dtype=dtype)
-    O = torch.empty_like(V)
-
-    mask_strict_upper = torch.triu(torch.ones(C, C, device=device, dtype=torch.bool), 1)
-
-    for i in range(L // C):
-        q_i = Q[:, i]
-        k_i = K[:, i]
-        w_i = W[:, i]
-        u_i = U[:, i] - w_i @ S
-
-        o_inter = q_i @ S
-        A_i = (q_i @ k_i.transpose(1, 2)).masked_fill(mask_strict_upper, 0)
-        o_intra = A_i @ u_i
-
-        S = S + k_i.transpose(1, 2) @ u_i
-        O[:, i] = o_intra + o_inter
-
-    return O.reshape(B, L, d)
 def delta_rule_recurrent_step(q_t, k_t, v_t, beta_t, S_prev):
-    v_old = S_prev @ k_t
-    v_new = beta_t * v_t + (1 - beta_t) * v_old
-    S_new = S_prev - torch.outer(v_old, k_t) + torch.outer(v_new, k_t)
-    o_t = S_new @ q_t
+    S_new = S_prev @ (torch.eye(S_prev.size(-1), device=S_prev.device) - beta_t * (k_t @ k_t.transpose(1,2))) + beta_t * (v_t @ k_t.transpose(1,2))
+    o_t = (S_new @ q_t).squeeze(2)
     return o_t, S_new
-
-
-class DeltaBlock(nn.Module):
-    def __init__(self, d, expand=1, neg_eigen=False):
-        super().__init__()
-        self.d = d
-        self.expand = expand
-        self.Wq = nn.Linear(d, d * expand)
-        self.Wk = nn.Linear(d, d * expand)
-        self.Wv = nn.Linear(d, d * expand)
-
-        self.beta = nn.Linear(d, 1)
-        self.sigma = nn.Sigmoid()
-        self.alpha = 2 if neg_eigen else 1
-
-        self.proj_out = nn.Linear(d * expand, d)
-
-    def forward(self, X, chunk=1):
-        B, L, d = X.shape
-        if chunk == 1:
-            chunk = L
-
-        Q = self.Wq(X)
-        K = self.Wk(X)
-        V = self.Wv(X) / self.alpha
-        beta = self.alpha * self.sigma(self.beta(X))
-
-        O = chunk_batched_delta_rule_forward(Q, K, V, beta, chunk)
-        return self.proj_out(O)
-
-    def step(self, X, S=None):
-        if S is None:
-            D = self.d * self.expand
-            S = torch.zeros(D, D, device=X.device, dtype=X.dtype)
-
-        q = self.Wq(X)
-        k = self.Wk(X)
-        v = self.Wv(X) / self.alpha
-        beta_t = self.alpha * self.sigma(self.beta(X))
-
-        y_fast, S_new = delta_rule_recurrent_step(q, k, v, beta_t, S)
-        return self.proj_out(y_fast), S_new
 
 # ============================================================
 # DeltaNet Transformer Block
 # ============================================================
 class DeltaNetBlock(nn.Module):
-    def __init__(self, dim, expand=1, ff_mult=4, neg_eigen=False, kernel_size=3, chunk=64):
+    def __init__(self, dim, neg_eigen=False):
         super().__init__()
-        self.chunk = chunk
-
         self.norm1 = RMSNorm(dim)
-        self.delta = DeltaBlock(dim, expand=expand, neg_eigen=neg_eigen)
 
         # q/k/v short convolution
-        self.conv_q = DepthwiseConv1d(dim)
-        self.conv_k = DepthwiseConv1d(dim)
-        self.conv_v = DepthwiseConv1d(dim)
+        self.W_q = nn.Linear(dim, dim)
+        self.W_k = nn.Linear(dim, dim)
+        self.W_v = nn.Linear(dim, dim)
+        self.W_beta = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.ReLU(),
+            nn.Linear(dim, 1),
+        )
+
 
         self.norm2 = RMSNorm(dim)
-        self.ff = SwiGLU(dim, dim * ff_mult)
+        self.ff = SwiGLU(dim, dim)
+        self.layernorm = nn.LayerNorm(dim)
 
-    def forward(self, x):
-        # ---- DeltaNet attention part ----
-        h = self.norm1(x)
+    def forward(self, x, S=None):
+        h = x
+        B, T, D = x.shape
 
         # conv before projections
-        h_q = self.conv_q(h)
-        h_k = self.conv_k(h)
-        h_v = self.conv_v(h)
-
+        q = self.W_q(h)
+        k = self.W_k(h)
+        v = self.W_v(h)
+        beta = torch.sigmoid(self.W_beta(h))  # [B,T,1]
         # temporarily replace input for DeltaBlock
         # use three input streams by concatenation trick
         # but simplest is: do separate projections INSIDE DeltaBlock
         # → we simply replace x with a mix containing q/k/v signals
         # easiest method: feed h_q + h_k + h_v
-        h_delta_in = h_q + h_k + h_v
 
-        attn_out = self.delta(h_delta_in, chunk=self.chunk)
-        x = x + attn_out
+        if( S is None):
+            S = torch.zeros(B, D, D, device=x.device, dtype=x.dtype)
+        outs = []
 
-        # ---- FFN ----
-        ff_out = self.ff(self.norm2(x))
-        x = x + ff_out
-        return x
+        for t in range(T):
+            k_t = k[:, t, :].unsqueeze(2)
+            v_t = v[:, t, :].unsqueeze(2)
+            q_t = q[:, t, :].unsqueeze(2)
+            b_t = beta[:, t, :].view(B, 1, 1)
 
+            o_t, S = delta_rule_recurrent_step(q_t, k_t, v_t, b_t, S)
+            outs.append(o_t)
+
+        delta_out = torch.stack(outs, dim=1)
+
+        return self.layernorm(delta_out), S
+
+        # delta_ff = x + delta_out
+        # # ---- FFN ----
+        # ff_out = self.ff(self.norm2(delta_ff))
+        # out = ff_out + delta_ff
+        # return out, S
 
 # ============================================================
 # Full DeltaNet Transformer
 # ============================================================
 class DeltaNetTransformer(nn.Module):
-    def __init__(self, d_model=128, d_ff=256, num_layers=6, dropout=0.1, chunk=1, neg_eigen=False):
+    def __init__(self, d_model=128, num_layers=2, neg_eigen=False):
         super().__init__()
 
-        ff_mult = d_ff // d_model
 
         self.layers = nn.ModuleList([
             DeltaNetBlock(
                 dim=d_model,
-                expand=1,
-                ff_mult=ff_mult,
-                neg_eigen=neg_eigen,
-                kernel_size=3,
-                chunk=chunk
+                neg_eigen=neg_eigen
             )
             for _ in range(num_layers)
         ])
@@ -476,7 +439,8 @@ class DeltaNetTransformer(nn.Module):
         self.proj_out = nn.Linear(d_model, d_model)
 
     def forward(self, x):
+        S = None
         for layer in self.layers:
-            x = layer(x)
+            x, S = layer(x, S)
         x = self.norm_out(x)
         return self.proj_out(x)

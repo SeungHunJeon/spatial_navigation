@@ -239,6 +239,7 @@ def train(model, cfg, epochs=1000, batch_size=64, lr1=2e-3, lr2=4e-4, lr_milesto
 
         opt.zero_grad()
         loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), 0.5)
         opt.step()
 
         if ep == lr_milestone:
@@ -302,7 +303,11 @@ def plot_mapping_example(model, cfg, out_dir, device="cpu", title=""):
     return path
 
 def run_one(args, cell_type, device, group=None):
-    cfg = TaskConfig(steps=args.steps)
+    cfg = TaskConfig(steps=args.steps,
+                     spiral_scale=args.spiral_scale,
+                     pitch_per_step=args.pitch_per_step,
+                     z_per_step=args.z_per_step,
+                     noise_landmark=args.noise_landmark)
     # Build model
     model = SpatialMemoryNet(steps=cfg.steps,
                              enc_hid=args.enc,
@@ -372,8 +377,13 @@ def run_one(args, cell_type, device, group=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cell", type=str, default="lstm",
-                    choices=["lstm","gru","sru_lstm", "sru_lstm_refined", "delta_transformer","deltanet","deltanet_transformer","all"])
+                    choices=["lstm","gru","sru_lstm", "sru_lstm_refined", "delta_transformer","deltanet","deltanet_transformer", "gated_deltanet", "all"])
     ap.add_argument("--steps", type=int, default=15)
+    ap.add_argument("--spiral_scale", type=float, default=1.0)
+    ap.add_argument("--pitch_per_step", type=float, default=0.15)
+    ap.add_argument("--z_per_step", type=float, default=0.5)
+    ap.add_argument("--noise_landmark", type=float, default=0.1)
+
     ap.add_argument("--hidden", type=int, default=128, help="RNN hidden size or Transformer d_model")
     ap.add_argument("--enc", type=int, default=128, help="Per-step encoder hidden (also d_model for transformer)")
     ap.add_argument("--epochs", type=int, default=1000)
@@ -385,8 +395,8 @@ def main():
     ap.add_argument("--device", type=str, default="cpu")
     ap.add_argument("--out", type=str, default="runs_figure2_se3")
     # Transformer-specific
-    ap.add_argument("--tf_heads", type=int, default=4)
-    ap.add_argument("--tf_layers", type=int, default=4)
+    ap.add_argument("--tf_heads", type=int, default=2)
+    ap.add_argument("--tf_layers", type=int, default=1)
     ap.add_argument("--tf_ff", type=int, default=256)
     ap.add_argument("--tf_dropout", type=float, default=0.1)
     # WANDB
@@ -402,7 +412,7 @@ def main():
     # If all, loop over all cells under a common WANDB group
     if args.cell == "all":
         group = args.wandb_group or "model-sweep"
-        for cell in ["lstm","gru","sru_lstm", "sru_lstm_refined", "delta_transformer", "deltanet", "deltanet_transformer"]:
+        for cell in ["lstm","gru","sru_lstm", "sru_lstm_refined", "delta_transformer", "deltanet", "deltanet_transformer", "gated_deltanet"]:
             run_one(args, cell, device, group=group)
     else:
         run_one(args, args.cell, device, group=args.wandb_group)
