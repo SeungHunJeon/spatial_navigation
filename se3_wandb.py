@@ -377,7 +377,7 @@ def run_one(args, cell_type, device, group=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cell", type=str, default="lstm",
-                    choices=["lstm","gru","sru_lstm", "sru_lstm_refined", "delta_transformer","deltanet","deltanet_transformer", "gated_deltanet", "all"])
+                    choices=["lstm","gru","sru_lstm", "sru_lstm_refined", "delta_transformer","deltanet","deltanet_transformer", "fla_deltanet", "fla_gated_deltanet", "all"])
     ap.add_argument("--steps", type=int, default=15)
     ap.add_argument("--spiral_scale", type=float, default=1.0)
     ap.add_argument("--pitch_per_step", type=float, default=0.15)
@@ -412,7 +412,7 @@ def main():
     # If all, loop over all cells under a common WANDB group
     if args.cell == "all":
         group = args.wandb_group or "model-sweep"
-        for cell in ["lstm","gru","sru_lstm", "sru_lstm_refined", "delta_transformer", "deltanet", "deltanet_transformer", "gated_deltanet"]:
+        for cell in ["lstm","gru","sru_lstm", "sru_lstm_refined", "delta_transformer", "deltanet", "deltanet_transformer", "fla_deltanet", "fla_gated_deltanet"]:
             run_one(args, cell, device, group=group)
     else:
         run_one(args, args.cell, device, group=args.wandb_group)

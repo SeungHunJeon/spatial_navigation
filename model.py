@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-
+from fla.models.utils import Cache
 # ========== 기존 PerStepEncoder 및 RNN 셀들 ==========
 class PerStepEncoder(nn.Module):
     def __init__(self, in_dim=3+1+7, hid=128):
@@ -126,6 +126,7 @@ class DeltaNetLayer(nn.Module):
             nn.Linear(beta_hidden, 1),
         )
         self.layernorm = nn.LayerNorm(d_model) if layernorm else nn.Identity()
+        self.beta_max = 0.3
 
     def forward(self, x, S=None):
         """
@@ -135,7 +136,8 @@ class DeltaNetLayer(nn.Module):
         q = self.W_q(x)
         k = self.W_k(x)
         v = self.W_v(x)
-        beta = torch.sigmoid(self.W_beta(x))  # [B,T,1]
+        beta_raw = self.W_beta(x)  # [B,T,1]
+        beta = torch.sigmoid(beta_raw) * self.beta_max  # constrain beta to [0, beta_max]
 
         if( S is None):
             S = torch.zeros(B, D, D, device=x.device, dtype=x.dtype)
@@ -207,6 +209,15 @@ class SpatialMemoryNet(nn.Module):
             self.hid = enc_hid
             self.decoder = HeadDecoder(enc_hid, steps)
 
+        elif cell_type == 'fla_deltanet':
+            self.aggregator = FLADeltaNet(
+                hidden_size=enc_hid,
+                num_heads=tf_heads,
+                mode='chunk',          # must be chunk mode for training
+            )
+            self.hid = enc_hid
+            self.decoder = HeadDecoder(enc_hid, steps)
+
         elif cell_type == "deltanet_transformer":
             self.aggregator = DeltaNetTransformer(
                 d_model=enc_hid, num_layers=tf_layers
@@ -214,12 +225,11 @@ class SpatialMemoryNet(nn.Module):
             self.hid = enc_hid
             self.decoder = HeadDecoder(enc_hid, steps)
 
-        elif cell_type == "gated_deltanet":
+        elif cell_type == "fla_gated_deltanet":
             self.aggregator = GatedDeltaNetAggregator(
                 d_model=enc_hid,
                 num_heads=tf_heads,
-                bidirectional=False,     # causal seq
-                min_len_for_chunk=65     # ensures chunk mode during training
+                mode='chunk'
             )
             self.hid = enc_hid
             self.decoder = HeadDecoder(enc_hid, steps)
@@ -248,12 +258,19 @@ class SpatialMemoryNet(nn.Module):
                 h_t, S = self.aggregator.forward(z[:, t, :].unsqueeze(1), S)
             h_T = h_t.squeeze(1)
 
+        elif self.cell_type == 'fla_deltanet':
+            hidden = Cache()
+            for t in range(T):
+                h_t, hidden = self.aggregator.forward(z[:, t, :].unsqueeze(1), past_key_values=hidden, use_cache=True)
+            h_T = h_t.squeeze(1)
+
         elif self.cell_type == 'deltanet_transformer':
             h_seq = self.aggregator(z)
             h_T = h_seq[:, -1, :]
 
-        elif self.cell_type == 'gated_deltanet':
-            h_T = self.aggregator(z)
+        elif self.cell_type == 'fla_gated_deltanet':
+            h_t = self.aggregator(z)
+            h_T = h_t[:, -1, :]
 
         coords_flat, label_logits = self.decoder(h_T)
         coords = coords_flat.view(B, self.steps, 3)
@@ -264,7 +281,31 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from fla.layers import GatedDeltaNet
+from fla.layers import GatedDeltaNet, DeltaNet
+
+class FLADeltaNet(nn.Module):
+    """
+    Wrapper for FLA GatedDeltaNet layer.
+
+    - Always uses chunk mode (stable for training).
+    - Output h_T is the final hidden state (index T-1).
+    """
+    def __init__(self, hidden_size=128, num_heads=4, mode="chunk"):
+        super().__init__()
+        self.delta = DeltaNet(
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            mode=mode,# must be chunk mode for training
+            layer_idx=0
+        )
+
+    def forward(self, z_seq, past_key_values=None, use_cache=False):
+        """
+        z_seq: (B, T, d)
+        return: (B, d)  -- final hidden state
+        """
+        y, _, hidden_state = self.delta(z_seq, past_key_values=past_key_values, use_cache=use_cache)
+        return y, hidden_state
 
 class GatedDeltaNetAggregator(nn.Module):
     """
@@ -275,51 +316,23 @@ class GatedDeltaNetAggregator(nn.Module):
       to force FLA to use chunk mode (the only mode stable in training).
     - Output h_T is always the *true* last-step state (index T-1).
     """
-    def __init__(self, d_model=128, num_heads=4, bidirectional=False, min_len_for_chunk=65):
+    def __init__(self, d_model=128, num_heads=4, mode="chunk"):
         super().__init__()
-        self.min_len_for_chunk = min_len_for_chunk
 
         # the official Gated DeltaNet layer
         self.delta = GatedDeltaNet(
             hidden_size=d_model,
             num_heads=num_heads,
-            bidirectional=bidirectional,
-            mode="chunk",          # must be chunk mode for training
-            chunk_size=None        # let FLA auto-select optimal chunk
+            mode=mode          # must be chunk mode for training
         )
 
-    def forward(self, z_seq, motion_seq=None):
+    def forward(self, z_seq, past_key_values=None, use_cache=False):
         """
         z_seq: (B, T, d)
         return: (B, d)  -- final hidden state
         """
-        B, T, D = z_seq.shape
-
-        # ========== TRAINING CASE (T <= 64 requires padding) ==========
-        if self.training and T <= 64:
-            pad_len = self.min_len_for_chunk - T
-            if pad_len < 0:
-                pad_len = 0
-
-            if pad_len > 0:
-                pad = torch.zeros(B, pad_len, D,
-                                  device=z_seq.device,
-                                  dtype=z_seq.dtype)
-                z_in = torch.cat([z_seq, pad], dim=1)  # (B, T+pad_len, D)
-            else:
-                z_in = z_seq
-
-            # Forward through FLA (returns y, kv, gate)
-            y, _, _ = self.delta(z_in)
-
-            # IMPORTANT:
-            # We must return the *true* last state of the real sequence
-            return y[:, T - 1, :]
-
-        # ========== EVAL OR LONG SEQ ==========
-        else:
-            y, _, _ = self.delta(z_seq)
-            return y[:, -1, :]
+        y, _, _ = self.delta(z_seq, past_key_values=past_key_values, use_cache=use_cache)
+        return y
 
 # ============================================================
 # RMSNorm
